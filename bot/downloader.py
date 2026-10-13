@@ -1,11 +1,13 @@
 """Video downloader using yt-dlp with size-aware format selection."""
 import asyncio
+import http.cookiejar
 import logging
 import os
 import subprocess
 import tempfile
+from html import unescape
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 import yt_dlp
 import re
 import requests
@@ -18,6 +20,14 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+INSTAGRAM_SHORTCODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+# Public app id of instagram.com's web client (also used by yt-dlp)
+INSTAGRAM_WEB_APP_ID = "936619743392459"
+
+
+class InstagramMediaUnavailable(Exception):
+    """The media API says the post doesn't exist or this session can't see it."""
+
 
 class VideoDownloader:
     """Downloads videos and images from supported social platforms using yt-dlp."""
@@ -28,48 +38,178 @@ class VideoDownloader:
         self.temp_dir = Path(tempfile.gettempdir()) / "discord_meme_bot"
         self.temp_dir.mkdir(exist_ok=True)
     
-    async def download(self, url: str) -> Optional[Tuple[Path, str]]:
+    async def download(self, url: str) -> Optional[Tuple[List[Path], str]]:
         """
-        Download video or image from URL.
-        
+        Download video or image(s) from URL.
+
         Returns:
-            Tuple of (file_path, title) if successful, None if failed
+            Tuple of (file_paths, title) if successful, None if failed.
+            Instagram carousels yield several files; everything else yields one.
         """
         # Run download in thread pool to avoid blocking
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self._download_sync, url)
-    
-    def _download_sync(self, url: str) -> Optional[Tuple[Path, str]]:
+
+    def _download_sync(self, url: str) -> Optional[Tuple[List[Path], str]]:
         """Synchronous download implementation for videos and images."""
         # Clean URL - remove tracking parameters for Instagram
         if 'instagram.com' in url:
-            # Remove query parameters like ?igsh=... 
+            # Remove query parameters like ?igsh=...
             original_url = url
             url = url.split('?')[0]
             logger.debug(f"Cleaned Instagram URL: {original_url} -> {url}")
-            
-            # For Instagram, try instaloader first if available
-            if INSTALOADER_AVAILABLE:
-                logger.info(f"Trying Instagram download with instaloader for {url}")
-                result = self._try_download_instagram(url)
-                if result:
-                    return result
-                logger.info(f"Instaloader failed, falling back to yt-dlp for {url}")
-        
+
+            # Photos and carousels: full-resolution originals from the media API.
+            # Single videos return None here and go through yt-dlp below.
+            try:
+                result = self._try_download_instagram_api(url)
+            except InstagramMediaUnavailable as e:
+                # Deleted/private/invalid post: the slower fallbacks would fail too
+                logger.info(f"Instagram post unavailable ({e}): {url}")
+                return None
+            if result:
+                return result
+
         output_template = str(self.temp_dir / "%(id)s.%(ext)s")
-        
+
         # First, try to download as video
         result = self._try_download_video(url, output_template)
         if result:
-            return result
-        
-        # If video download failed, try as image (for Instagram photo posts)
+            return ([result[0]], result[1])
+
         if 'instagram.com' in url:
+            # If video download failed, try as image (for Instagram photo posts)
             logger.info(f"Video download failed, trying HTML scrape for {url}")
-            return self._try_download_image(url, output_template)
-        
+            result = self._try_download_image(url, output_template)
+            if result:
+                return ([result[0]], result[1])
+
+            # Instaloader is tried last: anonymous GraphQL is usually rate-limited
+            # (403/401) and takes 5-10s to fail, so it shouldn't delay the paths above.
+            if INSTALOADER_AVAILABLE:
+                logger.info(f"HTML scrape failed, trying instaloader for {url}")
+                result = self._try_download_instagram(url)
+                if result:
+                    return ([result[0]], result[1])
+
         return None
-    
+
+    def _try_download_instagram_api(self, url: str) -> Optional[Tuple[List[Path], str]]:
+        """Download Instagram photo posts and carousels via the logged-in media info API.
+
+        Needs the cookies file (session). Returns None for single-video posts so
+        yt-dlp (with its size handling/compression) takes them, and on any error.
+        Raises InstagramMediaUnavailable when the API says the post doesn't exist.
+        """
+        if not (self.cookies_file and os.path.isfile(self.cookies_file)):
+            return None
+
+        match = re.search(r'/(?:p|reel|reels)/([A-Za-z0-9_-]+)', url)
+        if not match:
+            return None
+        shortcode = match.group(1)
+
+        # Shortcode is the base64-encoded media id; private-post shortcodes carry a
+        # 28-char suffix that isn't part of the id.
+        id_part = shortcode[:-28] if len(shortcode) > 28 else shortcode
+        media_id = 0
+        for ch in id_part:
+            media_id = media_id * 64 + INSTAGRAM_SHORTCODE_ALPHABET.index(ch)
+
+        try:
+            jar = http.cookiejar.MozillaCookieJar(self.cookies_file)
+            jar.load(ignore_discard=True, ignore_expires=True)
+        except Exception as e:
+            logger.debug(f"Could not load cookies from {self.cookies_file}: {e}")
+            return None
+        csrf = next((c.value for c in jar if c.name == 'csrftoken'), '')
+
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15',
+            'X-IG-App-ID': INSTAGRAM_WEB_APP_ID,
+            'X-CSRFToken': csrf,
+            'Referer': 'https://www.instagram.com/',
+        }
+
+        try:
+            resp = requests.get(
+                f"https://i.instagram.com/api/v1/media/{media_id}/info/",
+                headers=headers, cookies=jar, timeout=15,
+            )
+            if resp.status_code != 200:
+                message = resp.text[:200]
+                if resp.status_code in (400, 404) and (
+                    'Media not found' in message or 'Invalid media_id' in message
+                ):
+                    raise InstagramMediaUnavailable(message)
+                logger.info(f"Instagram media API returned {resp.status_code} for {url}")
+                return None
+            item = resp.json()['items'][0]
+        except InstagramMediaUnavailable:
+            raise
+        except Exception as e:
+            logger.info(f"Instagram media API failed for {url}: {type(e).__name__}: {e}")
+            return None
+
+        items = item.get('carousel_media') or [item]
+        if len(items) == 1 and items[0].get('video_versions'):
+            return None
+
+        caption = (item.get('caption') or {}).get('text') or ''
+        title = caption[:100] if caption else 'Instagram Photo'
+
+        files: List[Path] = []
+        for idx, media in enumerate(items, start=1):
+            if media.get('video_versions'):
+                media_url = media['video_versions'][0]['url']
+                ext = 'mp4'
+            else:
+                candidates = (media.get('image_versions2') or {}).get('candidates') or []
+                if not candidates:
+                    continue
+                media_url = max(candidates, key=lambda c: c.get('width', 0) * c.get('height', 0))['url']
+                ext = 'jpg'
+
+            path = self.temp_dir / f"{shortcode}_{idx}.{ext}"
+            if not self._fetch_to_file(media_url, path, headers['User-Agent']):
+                continue
+            if ext == 'mp4' and path.stat().st_size > self.max_file_size_bytes:
+                compressed = self._compress_video(path)
+                if not compressed:
+                    path.unlink(missing_ok=True)
+                    continue
+                path = compressed
+            files.append(path)
+
+        if not files:
+            logger.info(f"Instagram media API returned no downloadable items for {url}")
+            return None
+
+        logger.info(f"Downloaded {len(files)}/{len(items)} item(s) via Instagram media API for {url}")
+        return (files, title)
+
+    def _fetch_to_file(self, media_url: str, path: Path, user_agent: str) -> bool:
+        """Stream a media URL to disk. Videos may exceed the size cap (compressed later);
+        images over the cap are discarded."""
+        try:
+            with requests.get(media_url, headers={'User-Agent': user_agent}, stream=True, timeout=30) as r:
+                if r.status_code != 200:
+                    logger.debug(f"Media GET failed {media_url}: {r.status_code}")
+                    return False
+                with open(path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=64 * 1024):
+                        f.write(chunk)
+        except Exception as e:
+            logger.debug(f"Media download failed {media_url}: {type(e).__name__}: {e}")
+            path.unlink(missing_ok=True)
+            return False
+
+        if path.suffix != '.mp4' and path.stat().st_size > self.max_file_size_bytes:
+            logger.warning(f"Image exceeds size limit: {path.stat().st_size} bytes")
+            path.unlink(missing_ok=True)
+            return False
+        return True
+
     def _try_download_instagram(self, url: str) -> Optional[Tuple[Path, str]]:
         """Try to download Instagram content using instaloader.
         
@@ -201,6 +341,8 @@ class VideoDownloader:
 
         # Unescape common sequences
         image_url = image_url.replace('\\/','/').replace('\\u0026','&')
+        # og:image content is HTML-escaped (&amp;); the signed CDN URL returns 403 unless decoded
+        image_url = unescape(image_url)
 
         # Download the image
         try:
@@ -369,6 +511,11 @@ class VideoDownloader:
                 # If it's a private video or login required, don't retry
                 if 'private' in error_msg or 'login' in error_msg or 'unavailable' in error_msg:
                     logger.info(f"Content unavailable or requires login: {url}")
+                    return None
+
+                # Photo posts have no video at all; other format selectors won't help
+                if 'no video formats found' in error_msg:
+                    logger.info(f"No video formats found: {url}")
                     return None
 
                 continue

@@ -158,26 +158,23 @@ class MemeBot(commands.Bot):
             logger.warning(f"Cannot add reaction in channel {message.channel.id}")
         
         async with self.semaphore:
-            filepath: Optional[Path] = None
+            filepaths: list[Path] = []
             try:
                 # Download media (video or photo)
                 logger.info(f"Downloading media from {url}")
                 result = await self.downloader.download(url)
-                
+
                 if result is None:
-                    # Just remove the processing reaction and leave the message
-                    try:
-                        await message.remove_reaction("⏳", self.user)
-                    except Exception:
-                        pass
+                    await self._handle_download_failure(message, url, "No downloadable media found")
                     return
-                
-                filepath, title = result
-                file_size_mb = filepath.stat().st_size / (1024 * 1024)
-                logger.info(f"Downloaded {filepath.name} ({file_size_mb:.2f} MB)")
-                
+
+                filepaths, title = result
+                for filepath in filepaths:
+                    file_size_mb = filepath.stat().st_size / (1024 * 1024)
+                    logger.info(f"Downloaded {filepath.name} ({file_size_mb:.2f} MB)")
+
                 # Upload media to Discord
-                await self._upload_and_replace(message, filepath, title, url)
+                await self._upload_and_replace(message, filepaths, title, url)
                 
             except discord.errors.HTTPException as e:
                 logger.error(f"Discord API error: {e}")
@@ -186,52 +183,69 @@ class MemeBot(commands.Bot):
                 logger.error(f"Error processing {url}: {e}", exc_info=True)
                 await self._handle_download_failure(message, url)
             finally:
-                # Cleanup temp file
-                if filepath:
+                # Cleanup temp files
+                for filepath in filepaths:
                     self.downloader.cleanup(filepath)
     
     async def _upload_and_replace(
         self, 
         message: discord.Message, 
-        filepath: Path, 
+        filepaths: list[Path],
         title: str,
         source_url: str
     ):
-        """Upload media (prefer channel webhook) and delete original message."""
+        """Upload media (prefer channel webhook) and delete original message.
+
+        Several files (Instagram carousels) are sent in batches that respect
+        Discord's 10-attachments-per-message limit and the configured size cap.
+        """
         content = None
-        sent_via_webhook = False
 
-        def make_file() -> discord.File:
-            return discord.File(str(filepath), filename=filepath.name)
+        batches: list[list[Path]] = []
+        batch_size = 0
+        for filepath in filepaths:
+            size = filepath.stat().st_size
+            if batches and len(batches[-1]) < 10 and batch_size + size <= config.max_file_size_bytes:
+                batches[-1].append(filepath)
+                batch_size += size
+            else:
+                batches.append([filepath])
+                batch_size = size
 
-        # Try webhook if configured for the channel
+        def make_files(batch: list[Path]) -> list[discord.File]:
+            return [discord.File(str(p), filename=p.name) for p in batch]
+
+        # Try webhook if configured for the channel; once it fails, use the bot for the rest
         webhook_url = config.webhook_url_for_channel(message.channel.id)
-        if webhook_url:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    webhook = discord.Webhook.from_url(webhook_url, session=session)
-                    await webhook.send(
-                        content=content,
-                        file=make_file(),
-                        username=message.author.display_name,
-                        avatar_url=message.author.display_avatar.url,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                        wait=True,
-                    )
-                    sent_via_webhook = True
-                    logger.info(f"Uploaded media via webhook for message {message.id}")
-            except Exception as e:
-                logger.warning(f"Webhook send failed for channel {message.channel.id}: {e}")
-                sent_via_webhook = False
+        use_webhook = bool(webhook_url)
+        for batch in batches:
+            sent_via_webhook = False
+            if use_webhook:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        webhook = discord.Webhook.from_url(webhook_url, session=session)
+                        await webhook.send(
+                            content=content,
+                            files=make_files(batch),
+                            username=message.author.display_name,
+                            avatar_url=message.author.display_avatar.url,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                            wait=True,
+                        )
+                        sent_via_webhook = True
+                        logger.info(f"Uploaded {len(batch)} file(s) via webhook for message {message.id}")
+                except Exception as e:
+                    logger.warning(f"Webhook send failed for channel {message.channel.id}: {e}")
+                    use_webhook = False
 
-        # Fallback to normal send
-        if not sent_via_webhook:
-            await message.channel.send(
-                content=content,
-                file=make_file(),
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            logger.info(f"Uploaded media for message {message.id}")
+            # Fallback to normal send
+            if not sent_via_webhook:
+                await message.channel.send(
+                    content=content,
+                    files=make_files(batch),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                logger.info(f"Uploaded {len(batch)} file(s) for message {message.id}")
         
         # Delete original message
         try:
@@ -252,7 +266,7 @@ class MemeBot(commands.Bot):
         
         async with self.semaphore:
             downloaded_images = []
-            downloaded_video: Optional[Path] = None
+            downloaded_videos: list[Path] = []
             try:
                 logger.info(f"Fetching Reddit post from {url}")
 
@@ -269,10 +283,10 @@ class MemeBot(commands.Bot):
                     logger.info(f"Downloading Reddit video from {post.video_url}")
                     result = await self.downloader.download(post.video_url)
                     if result is not None:
-                        downloaded_video, _ = result
+                        downloaded_videos, _ = result
                         await self._upload_and_replace(
                             message,
-                            downloaded_video,
+                            downloaded_videos,
                             post.title,
                             post.video_url,
                         )
@@ -363,8 +377,8 @@ class MemeBot(commands.Bot):
                 # Cleanup downloaded images/video
                 for img_path in downloaded_images:
                     self.reddit_handler.cleanup(img_path)
-                if downloaded_video:
-                    self.downloader.cleanup(downloaded_video)
+                for video_path in downloaded_videos:
+                    self.downloader.cleanup(video_path)
     
     async def _handle_download_failure(
         self, 
@@ -374,6 +388,9 @@ class MemeBot(commands.Bot):
         silent: bool = False
     ):
         """Handle failed download by adding error reaction and optional reply."""
+        # Forget the URL so reposting it retries immediately instead of being deduped
+        self._recent_urls.pop(url, None)
+
         try:
             # Remove processing reaction
             await message.remove_reaction("⏳", self.user)
