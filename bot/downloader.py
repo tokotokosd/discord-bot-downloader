@@ -4,6 +4,7 @@ import logging
 import os
 import subprocess
 import tempfile
+from html import unescape
 from pathlib import Path
 from typing import Optional, Tuple
 import yt_dlp
@@ -201,6 +202,8 @@ class VideoDownloader:
 
         # Unescape common sequences
         image_url = image_url.replace('\\/','/').replace('\\u0026','&')
+        # og:image content is HTML-escaped (&amp;); the signed CDN URL returns 403 unless decoded
+        image_url = unescape(image_url)
 
         # Download the image
         try:
