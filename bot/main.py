@@ -165,11 +165,7 @@ class MemeBot(commands.Bot):
                 result = await self.downloader.download(url)
                 
                 if result is None:
-                    # Just remove the processing reaction and leave the message
-                    try:
-                        await message.remove_reaction("⏳", self.user)
-                    except Exception:
-                        pass
+                    await self._handle_download_failure(message, url, "No downloadable media found")
                     return
                 
                 filepath, title = result
@@ -374,6 +370,9 @@ class MemeBot(commands.Bot):
         silent: bool = False
     ):
         """Handle failed download by adding error reaction and optional reply."""
+        # Forget the URL so reposting it retries immediately instead of being deduped
+        self._recent_urls.pop(url, None)
+
         try:
             # Remove processing reaction
             await message.remove_reaction("⏳", self.user)

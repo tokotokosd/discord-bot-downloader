@@ -4,6 +4,7 @@ import logging
 import os
 import subprocess
 import tempfile
+from html import unescape
 from pathlib import Path
 from typing import Optional, Tuple
 import yt_dlp
@@ -47,27 +48,27 @@ class VideoDownloader:
             original_url = url
             url = url.split('?')[0]
             logger.debug(f"Cleaned Instagram URL: {original_url} -> {url}")
-            
-            # For Instagram, try instaloader first if available
-            if INSTALOADER_AVAILABLE:
-                logger.info(f"Trying Instagram download with instaloader for {url}")
-                result = self._try_download_instagram(url)
-                if result:
-                    return result
-                logger.info(f"Instaloader failed, falling back to yt-dlp for {url}")
-        
+
         output_template = str(self.temp_dir / "%(id)s.%(ext)s")
-        
+
         # First, try to download as video
         result = self._try_download_video(url, output_template)
         if result:
             return result
-        
-        # If video download failed, try as image (for Instagram photo posts)
+
         if 'instagram.com' in url:
+            # If video download failed, try as image (for Instagram photo posts)
             logger.info(f"Video download failed, trying HTML scrape for {url}")
-            return self._try_download_image(url, output_template)
-        
+            result = self._try_download_image(url, output_template)
+            if result:
+                return result
+
+            # Instaloader is tried last: anonymous GraphQL is usually rate-limited
+            # (403/401) and takes 5-10s to fail, so it shouldn't delay the paths above.
+            if INSTALOADER_AVAILABLE:
+                logger.info(f"HTML scrape failed, trying instaloader for {url}")
+                return self._try_download_instagram(url)
+
         return None
     
     def _try_download_instagram(self, url: str) -> Optional[Tuple[Path, str]]:
@@ -201,6 +202,8 @@ class VideoDownloader:
 
         # Unescape common sequences
         image_url = image_url.replace('\\/','/').replace('\\u0026','&')
+        # og:image content is HTML-escaped (&amp;); the signed CDN URL returns 403 unless decoded
+        image_url = unescape(image_url)
 
         # Download the image
         try:
@@ -369,6 +372,11 @@ class VideoDownloader:
                 # If it's a private video or login required, don't retry
                 if 'private' in error_msg or 'login' in error_msg or 'unavailable' in error_msg:
                     logger.info(f"Content unavailable or requires login: {url}")
+                    return None
+
+                # Photo posts have no video at all; other format selectors won't help
+                if 'no video formats found' in error_msg:
+                    logger.info(f"No video formats found: {url}")
                     return None
 
                 continue
